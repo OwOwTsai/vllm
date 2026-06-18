@@ -49,6 +49,29 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+try:
+    from vllm_flydsl.gemm import run_block_fp8_gemm as _run_block_fp8_gemm
+    _FLYDSL_GEMM_AVAILABLE = True
+except ImportError:
+    _FLYDSL_GEMM_AVAILABLE = False
+
+# Evaluated once at import time — env var and platform don't change at runtime.
+_FLYDSL_GEMM_ENABLED: bool = (
+    _FLYDSL_GEMM_AVAILABLE
+    and current_platform.is_rocm()
+    and os.environ.get("VLLM_USE_FLYDSL_BLOCK_FP8_GEMM", "0") == "1"
+)
+if _FLYDSL_GEMM_AVAILABLE and not current_platform.is_rocm():
+    logger.debug("FlyDSL block FP8 GEMM available but not on ROCm; disabled.")
+elif not _FLYDSL_GEMM_AVAILABLE and os.environ.get("VLLM_USE_FLYDSL_BLOCK_FP8_GEMM", "0") == "1":
+    logger.warning(
+        "VLLM_USE_FLYDSL_BLOCK_FP8_GEMM=1 but vllm_flydsl is not installed; "
+        "falling back to Triton."
+    )
+if _FLYDSL_GEMM_ENABLED:
+    logger.info("W8A8 Block FP8: using FlyDSL backend (RDNA4).")
+
+
 
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
     if isinstance(x, torch.Tensor):
@@ -108,6 +131,39 @@ direct_register_custom_op(
     "w8a8_triton_block_scaled_mm_func",
     _w8a8_triton_block_scaled_mm_func,
     fake_impl=_w8a8_triton_block_scaled_mm_fake,
+)
+
+
+def _w8a8_flydsl_block_scaled_mm_func(
+    qx: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return w8a8_flydsl_block_scaled_mm(
+        qx, weight, x_scale, weight_scale, block_size, output_dtype
+    )
+
+
+def _w8a8_flydsl_block_scaled_mm_fake(
+    qx: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.empty(
+        (qx.size(0), weight.size(0)), dtype=output_dtype, device=qx.device
+    )
+
+
+direct_register_custom_op(
+    "w8a8_flydsl_block_scaled_mm_func",
+    _w8a8_flydsl_block_scaled_mm_func,
+    fake_impl=_w8a8_flydsl_block_scaled_mm_fake,
 )
 
 
@@ -533,6 +589,25 @@ class W8A8BlockFp8LinearOp:
             input_2d.dtype,
         )
 
+    def _run_flydsl(
+        self,
+        input_2d: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        input_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert input_scale is None
+        assert self.input_quant_op is not None
+        q_input, x_scale = self.input_quant_op(input_2d)
+        return torch.ops.vllm.w8a8_flydsl_block_scaled_mm_func(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            list(self.weight_group_shape),
+            input_2d.dtype,
+        )
+
     def _run_flashinfer(
         self,
         input_2d: torch.Tensor,
@@ -583,6 +658,15 @@ class W8A8BlockFp8LinearOp:
             )
         if use_aiter_and_is_supported:
             return self._run_aiter, None
+        if _FLYDSL_GEMM_ENABLED:
+            return self._run_flydsl, (
+                QuantFP8(
+                    False,
+                    self.act_quant_group_shape,
+                    column_major_scales=False,
+                    use_ue8m0=False,
+                )
+            )
         return self._run_triton, (
             QuantFP8(
                 False,
@@ -1158,7 +1242,25 @@ def get_w8a8_block_fp8_configs(
         config_file_path,
     )
     return None
+def w8a8_flydsl_block_scaled_mm(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list[int],
+    output_dtype: torch.dtype = torch.float16,
+) -> torch.Tensor:
+    """Block-wise FP8 GEMM via FlyDSL kernel (RDNA4 / ROCm).
 
+    Interface mirrors w8a8_triton_block_scaled_mm.
+      A  : [M, K]             float8_e4m3fn, row-major
+      B  : [N, K]             float8_e4m3fn, row-major
+      As : [M, k_tiles]       float32  per-token-group scales
+      Bs : [n_tiles, k_tiles] float32  per-block weight scales
+    """
+    assert _FLYDSL_GEMM_AVAILABLE, "FlyDSL is not installed"
+    M = A.numel() // A.shape[-1]
+    return _run_block_fp8_gemm(A, B, As, Bs, block_size, output_dtype)
 
 def w8a8_triton_block_scaled_mm(
     A: torch.Tensor,
@@ -1374,13 +1476,14 @@ def prepare_fp8_moe_layer_for_deepgemm(
 
     return w13, w2, w13_scale, w2_scale
 
-
+from vllm.platforms.rocm import on_mi3xx
 def _maybe_pad_fp8_weight(weight: torch.Tensor) -> torch.Tensor:
     """Pad the weight tensor. This is an optimization on ROCm platform, which
     can benefit from tensors located far enough from one another in memory"""
     if (
         envs.VLLM_ROCM_FP8_PADDING
         and current_platform.is_rocm()
+        and on_mi3xx()
         and weight.stride(-1) == 1
         and (weight.stride(-2) * weight.element_size()) % 512 == 0
     ):

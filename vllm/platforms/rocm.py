@@ -240,6 +240,16 @@ class RocmPlatform(Platform):
             logger.info("Using FlexAttention backend.")
             return AttentionBackendEnum.FLEX_ATTENTION.get_path()
 
+        if selected_backend == AttentionBackendEnum.FLYDSL_ATTN:
+            if os.environ.get("VLLM_USE_TRITON_FLASH_ATTN", "0") == "1":
+                logger.warning(
+                    "VLLM_USE_TRITON_FLASH_ATTN=1 and VLLM_USE_FLYDSL_FLASH_ATTN=1 "
+                    "are both set. FlyDSL attention takes priority; Triton "
+                    "unified_attention remains the per-request fallback."
+                )
+            logger.info("Using FlyDSL Attention backend.")
+            return AttentionBackendEnum.FLYDSL_ATTN.get_path()
+
         if selected_backend == AttentionBackendEnum.TRITON_ATTN:
             logger.info("Using Triton Attention backend.")
             return AttentionBackendEnum.TRITON_ATTN.get_path()
@@ -289,6 +299,15 @@ class RocmPlatform(Platform):
             ):
                 logger.info("Using Aiter Flash Attention backend.")
                 return AttentionBackendEnum.ROCM_AITER_FA.get_path()
+            if os.environ.get("VLLM_USE_FLYDSL_FLASH_ATTN", "0") == "1":
+                if os.environ.get("VLLM_USE_TRITON_FLASH_ATTN", "0") == "1":
+                    logger.warning(
+                        "VLLM_USE_TRITON_FLASH_ATTN=1 and VLLM_USE_FLYDSL_FLASH_ATTN=1 "
+                        "are both set. FlyDSL attention takes priority; Triton "
+                        "unified_attention remains the per-request fallback."
+                    )
+                logger.info("Using FlyDSL Attention backend.")
+                return AttentionBackendEnum.FLYDSL_ATTN.get_path()
 
             # Default: Triton Unified Attention
             logger.info("Using Triton Attention backend.")
