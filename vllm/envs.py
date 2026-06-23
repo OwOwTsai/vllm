@@ -276,6 +276,7 @@ if TYPE_CHECKING:
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
     VLLM_PREFIX_CACHE_RETENTION_INTERVAL: int | None = None
+    VLLM_ROCM_ACTIVATION_HEADROOM: bool = False
 
 
 def get_default_cache_root():
@@ -1854,6 +1855,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # memory allocation. Enabled by default as of v0.21.0
     "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": lambda: bool(
         int(os.getenv("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS", "1"))
+    ),
+    # On ROCm, subtract peak activation memory from available KV cache to
+    # prevent allocator fragmentation OOM during inference. Set to 0 to
+    # disable (e.g. for hybrid Mamba models that need more KV cache blocks).
+    "VLLM_ROCM_ACTIVATION_HEADROOM": lambda: bool(
+        int(os.getenv("VLLM_ROCM_ACTIVATION_HEADROOM", "0"))
     ),
     # NIXL EP environment variables
     "VLLM_NIXL_EP_MAX_NUM_RANKS": lambda: int(

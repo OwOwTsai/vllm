@@ -464,6 +464,27 @@ class Worker(WorkerBase):
             - cudagraph_memory_estimate_applied
         )
 
+        # On ROCm, the CUDA caching allocator's reserved pool becomes fragmented
+        # over successive inference iterations. The peak activation memory measured
+        # during profile_run (e.g. a large FP8 GEMM output buffer) is freed after
+        # profiling and enters the reserved pool as fragmented chunks. When KV cache
+        # is then allocated to fill the remaining space, later inference calls cannot
+        # find a contiguous block of that size and OOM.
+        #
+        # Fix: subtract peak_activation_memory from available KV cache so a
+        # contiguous block of that size always remains free during inference.
+        # On CUDA this is unnecessary because expandable_segments handles it.
+        if current_platform.is_rocm() and envs.VLLM_ROCM_ACTIVATION_HEADROOM:
+            activation_headroom = profile_result.torch_peak_increase
+            self.available_kv_cache_memory_bytes = max(
+                0, self.available_kv_cache_memory_bytes - activation_headroom
+            )
+            logger.debug(
+                "ROCm: reserving additional %s GiB headroom for peak activation "
+                "buffers to prevent allocator fragmentation OOM.",
+                format_gib(activation_headroom),
+            )
+
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
